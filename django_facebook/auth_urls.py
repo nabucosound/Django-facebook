@@ -27,14 +27,15 @@ from django.conf.urls.defaults import *
 
 from django.contrib.auth import views as auth_views
 from django_facebook import registration_views
+from django_facebook.utils import replication_safe
 
 urlpatterns = patterns('',
                        url(r'^login/$',
-                           auth_views.login,
+                           replication_safe(auth_views.login),
                            {'template_name': 'registration/login.html'},
                            name='auth_login'),
                        url(r'^logout/$',
-                           auth_views.logout,
+                           replication_safe(auth_views.logout),
                            {'template_name': 'registration/logout.html'},
                            name='auth_logout'),
                        url(r'^password/change/$',
@@ -46,7 +47,8 @@ urlpatterns = patterns('',
                        url(r'^password/reset/$',
                            auth_views.password_reset,
                            name='auth_password_reset'),
-                       url(r'^password/reset/confirm/(?P<uidb36>[0-9A-Za-z]+)-(?P<token>.+)/$',
+                       url(
+                           r'^password/reset/confirm/(?P<uidb36>[0-9A-Za-z]+)-(?P<token>.+)/$',
                            auth_views.password_reset_confirm,
                            name='auth_password_reset_confirm'),
                        url(r'^password/reset/complete/$',
@@ -55,7 +57,7 @@ urlpatterns = patterns('',
                        url(r'^password/reset/done/$',
                            auth_views.password_reset_done,
                            name='auth_password_reset_done'),
-                        url(r'^register/$',
-                            registration_views.register,
-                            name='registration_register'),
-)
+                       url(r'^register/$',
+                           registration_views.register,
+                           name='registration_register'),
+                       )

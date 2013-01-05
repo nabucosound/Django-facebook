@@ -6,7 +6,7 @@ import re
 from django_facebook import settings as facebook_settings
 from django.utils.encoding import iri_to_uri
 from django.template.loader import render_to_string
-from django_facebook.registration_backends import FacebookRegistrationBackend
+import gc
 
 
 logger = logging.getLogger(__name__)
@@ -23,25 +23,44 @@ def clear_persistent_graph_cache(request):
         profile.clear_access_token()
 
 
+def queryset_iterator(queryset, chunksize=1000, getfunc=getattr):
+    '''''
+    Iterate over a Django Queryset ordered by the primary key
+
+    This method loads a maximum of chunksize (default: 1000) rows in it's
+    memory at the same time while django normally would load all rows in it's
+    memory. Using the iterator() method only causes it to not preload all the
+    classes.
+
+    Note that the implementation of the iterator does not support ordered query sets.
+    '''
+    pk = 0
+
+    try:
+        '''In the case of an empty list, return'''
+        last_pk = getfunc(queryset.order_by('-pk')[0], 'pk')
+    except IndexError:
+        return
+
+    queryset = queryset.order_by('pk')
+    while pk < last_pk:
+        for row in queryset.filter(pk__gt=pk)[:chunksize].iterator():
+            pk = getfunc(row, 'pk')
+            yield row
+        gc.collect()
+
+
 def test_permissions(request, scope_list, redirect_uri=None):
     '''
     Call Facebook me/permissions to see if we are allowed to do this
     '''
     from django_facebook.api import get_persistent_graph
-    from open_facebook import exceptions as facebook_exceptions
+
     fb = get_persistent_graph(request, redirect_uri=redirect_uri)
     permissions_dict = {}
     if fb:
-        try:
-            permissions_response = fb.get('me/permissions')
-            permissions = permissions_response['data'][0]
-        except facebook_exceptions.OAuthException:
-            # this happens when someone revokes their permissions
-            # while the session is still stored
-            permissions = {}
-        permissions_dict = dict([(k, bool(int(v)))
-                                 for k, v in permissions.items()
-                                 if v == '1' or v == 1])
+        #see what permissions we have
+        permissions_dict = fb.permissions()
 
     # see if we have all permissions
     scope_allowed = True
@@ -52,9 +71,9 @@ def test_permissions(request, scope_list, redirect_uri=None):
     # raise if this happens after a redirect though
     if not scope_allowed and request.GET.get('attempt'):
         raise ValueError(
-              'Somehow facebook is not giving us the permissions needed, ' \
-              'lets break instead of endless redirects. Fb was %s and ' \
-              'permissions %s' % (fb, permissions_dict))
+            'Somehow facebook is not giving us the permissions needed, '
+            'lets break instead of endless redirects. Fb was %s and '
+            'permissions %s' % (fb, permissions_dict))
 
     return scope_allowed
 
@@ -71,6 +90,7 @@ def get_oauth_url(request, scope, redirect_uri=None, extra_params=None):
     query_dict['scope'] = ','.join(scope)
     query_dict['client_id'] = facebook_settings.FACEBOOK_APP_ID
     redirect_uri = redirect_uri or request.build_absolute_uri()
+    current_uri = redirect_uri
 
     # set attempt=1 to prevent endless redirect loops
     if 'attempt=1' not in redirect_uri:
@@ -79,24 +99,10 @@ def get_oauth_url(request, scope, redirect_uri=None, extra_params=None):
         else:
             redirect_uri += '&attempt=1'
 
-    # add the extra params if specified
-    # TODO: renable this and fix the url merging!!
-    if extra_params and False:
-        # from open_facebook.utils import merge_urls
-        # TODO: Properly merge the url params
-        params_query_dict = QueryDict('', True)
-        params_query_dict.update(extra_params)
-        query_string = params_query_dict.urlencode()
-        if '?' not in redirect_uri:
-            redirect_uri += '?'
-        else:
-            redirect_uri += '&'
-        redirect_uri += query_string
-
     query_dict['redirect_uri'] = redirect_uri
-    url = 'https://www.facebook.com/dialog/oauth?'
-    url += query_dict.urlencode()
-    return url, redirect_uri
+    oauth_url = 'https://www.facebook.com/dialog/oauth?'
+    oauth_url += query_dict.urlencode()
+    return oauth_url, current_uri, redirect_uri
 
 
 class CanvasRedirect(HttpResponse):
@@ -106,20 +112,35 @@ class CanvasRedirect(HttpResponse):
     def __init__(self, redirect_to):
         self.redirect_to = redirect_to
         self.location = iri_to_uri(redirect_to)
-        
+
         context = dict(location=self.location)
-        js_redirect = render_to_string('django_facebook/canvas_redirect.html', context)
-        
+        js_redirect = render_to_string(
+            'django_facebook/canvas_redirect.html', context)
+
         super(CanvasRedirect, self).__init__(js_redirect)
-        
+
+
 def response_redirect(redirect_url, canvas=False):
     '''
     Abstract away canvas redirects
     '''
     if canvas:
         return CanvasRedirect(redirect_url)
-    
+
     return HttpResponseRedirect(redirect_url)
+
+
+def error_next_redirect(request, default='/', additional_params=None, next_key=None, redirect_url=None, canvas=False):
+    '''
+    Short cut for an error next redirect
+    '''
+    if not next_key:
+        next_key = ['error_next', 'next']
+
+    redirect = next_redirect(
+        request, default, additional_params, next_key, redirect_url, canvas)
+    return redirect
+
 
 def next_redirect(request, default='/', additional_params=None,
                   next_key='next', redirect_url=None, canvas=False):
@@ -148,7 +169,7 @@ def next_redirect(request, default='/', additional_params=None,
 
     if canvas:
         return CanvasRedirect(redirect_url)
-    
+
     return HttpResponseRedirect(redirect_url)
 
 
@@ -174,7 +195,8 @@ def mass_get_or_create(model_class, base_queryset, id_field, default_dict,
     >>> global_defaults = dict(user=request.user, list_id=1) #global defaults
     '''
     current_instances = list(base_queryset)
-    current_ids = set([unicode(getattr(c, id_field)) for c in current_instances])
+    current_ids = set(
+        [unicode(getattr(c, id_field)) for c in current_instances])
     given_ids = map(unicode, default_dict.keys())
     #both ends of the comparison are in unicode ensuring the not in works
     new_ids = [g for g in given_ids if g not in current_ids]
@@ -210,9 +232,9 @@ def get_form_class(backend, request):
         backend = backend or get_registration_backend()
         if backend:
             form_class = backend.get_form_class(request)
-            
+
     assert form_class, 'we couldnt find a form class, so we cant go on like this'
-            
+
     return form_class
 
 
@@ -222,17 +244,17 @@ def get_registration_backend():
     '''
     backend = None
     backend_class = None
-    
-    registration_backend_string = getattr(facebook_settings, 'FACEBOOK_REGISTRATION_BACKEND', None)
+
+    registration_backend_string = getattr(
+        facebook_settings, 'FACEBOOK_REGISTRATION_BACKEND', None)
     if registration_backend_string:
         backend_class = get_class_from_string(registration_backend_string)
-       
+
     #instantiate
     if backend_class:
         backend = backend_class()
-        
-    return backend
 
+    return backend
 
 
 def get_django_registration_version():
@@ -247,12 +269,12 @@ def get_django_registration_version():
         version = 'new'
     except ImportError:
         version = 'old'
-        
+
     try:
         import registration
     except ImportError, e:
         version = None
-    
+
     return version
 
 
@@ -307,6 +329,22 @@ def to_int(input, default=0, exception=(ValueError, TypeError), regexp=None):
         return default
 
 
+def to_bool(input, default=False):
+    '''
+    Take a request value and turn it into a bool
+    Never raises errors
+    '''
+    if input is None:
+        value = default
+    else:
+        int_value = to_int(input, default=None)
+        if int_value is None:
+            value = default
+        else:
+            value = bool(int_value)
+    return value
+
+
 def remove_query_param(url, key):
     p = re.compile('%s=[^=&]*&' % key, re.VERBOSE)
     url = p.sub('', url)
@@ -352,6 +390,28 @@ def cleanup_oauth_url(redirect_uri):
     return redirect_uri
 
 
+def replication_safe(f):
+    '''
+    Usually views which do a POST will require the next page to be
+    read from the master database. (To prevent issues with replication lag).
+
+    However certain views like login do not have this issue.
+    They do a post, but don't modify data which you'll show on subsequent pages.
+
+    This decorators marks these views as safe.
+    This ensures requests on the next page are allowed to use the slave db
+    '''
+    from functools import wraps
+
+    @wraps(f)
+    def wrapper(request, *args, **kwargs):
+        request.replication_safe = True
+        response = f(request, *args, **kwargs)
+        return response
+
+    return wrapper
+
+
 def get_class_from_string(path, default='raise'):
     """
     Return the class specified by the string.
@@ -382,7 +442,7 @@ def get_class_from_string(path, default='raise'):
     except AttributeError:
         if default == 'raise':
             raise ImproperlyConfigured(
-                'Module "%s" does not define a registration ' \
+                'Module "%s" does not define a registration '
                 'backend named "%s"' % (module, attr))
         else:
             backend_class = default

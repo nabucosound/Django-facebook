@@ -1,26 +1,201 @@
 from __future__ import with_statement
 from django.contrib.auth.models import AnonymousUser, User
-from django_facebook import settings as facebook_settings
-from django_facebook import exceptions as facebook_exceptions
+from django.core.urlresolvers import reverse
+from django.test.client import Client
+from django_facebook import exceptions as facebook_exceptions, \
+    settings as facebook_settings, signals
+from django_facebook.api import get_facebook_graph, FacebookUserConverter, \
+    get_persistent_graph
 from django_facebook.auth_backends import FacebookBackend
-from django_facebook.connect import (_register_user, connect_user,
-                                     CONNECT_ACTIONS)
-from django_facebook.tests_utils.base import FacebookTest
-from django_facebook.utils import get_profile_class
-from django_facebook.api import (get_facebook_graph, FacebookUserConverter,
-                                 get_persistent_graph)
-from django_facebook import signals
-import logging
-from open_facebook.api import FacebookConnection
+from django_facebook.connect import _register_user, connect_user, \
+    CONNECT_ACTIONS
+from django_facebook.tests_utils.base import FacebookTest, LiveFacebookTest, \
+    RequestMock
+from django_facebook.utils import cleanup_oauth_url, get_profile_class
 from functools import partial
-from django_facebook.utils import cleanup_oauth_url
-from django_facebook.tests_utils.base import RequestMock
+from mock import Mock, patch
+from open_facebook.api import FacebookConnection, FacebookAuthorization
+from open_facebook.exceptions import FacebookSSLError, FacebookURLError
+import logging
+import mock
+
 
 logger = logging.getLogger(__name__)
-
-
 __doctests__ = ['django_facebook.api']
 
+
+class TestUserTest(LiveFacebookTest):
+    def test_create_test_user(self):
+        #Also, somehow unittest.skip doesnt work with travis ci?
+        return 'Skipping since you might have created test users manually, lets not delete them :)'
+        #start by clearing out our test users (maybe this isnt safe to use in testing)
+        #if other people create test users manualy this could be annoying
+        app_access_token = FacebookAuthorization.get_cached_app_access_token()
+        FacebookAuthorization.delete_test_users(app_access_token)
+        #the permissions for which we want a test user
+        permissions = ['email', 'publish_actions']
+        #gets the test user object
+        test_user = FacebookAuthorization.get_or_create_test_user(
+            app_access_token, permissions)
+        graph = test_user.graph()
+        me = graph.me()
+        assert me
+
+
+class ExtendTokenTest(LiveFacebookTest):
+    def test_extend_token(self):
+        return 'this doesnt work in travis, but locally its fine... weird'
+        app_access_token = FacebookAuthorization.get_cached_app_access_token()
+        test_user = FacebookAuthorization.get_or_create_test_user(
+            app_access_token)
+        access_token = test_user.access_token
+        results = FacebookAuthorization.extend_access_token(access_token)
+        if 'access_token' not in results:
+            raise ValueError('we didnt get a fresh token')
+
+
+class UserConnectViewTest(FacebookTest):
+    fixtures = ['users.json']
+
+    def test_connect(self):
+        '''
+        Test if we can do logins
+        django_facebook.connect.connect_user
+        '''
+        user = User.objects.all()[:1][0]
+        url = reverse('facebook_connect')
+
+        #see if the basics don't give errors
+        response = self.client.get('%s?facebook_login=a' % url)
+        self.assertEqual(response.status_code, 200)
+        response = self.client.get('%s?facebook_login=0' % url)
+        self.assertEqual(response.status_code, 200)
+        response = self.client.get('%s?facebook_login=' % url)
+        self.assertEqual(response.status_code, 200)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+
+        #test registration flow
+        from django_facebook.connect import connect_user
+        with patch('django_facebook.views.connect_user', return_value=(CONNECT_ACTIONS.REGISTER, user)) as wrapped_connect:
+            post_data = dict(access_token='short_username',
+                             next='%s?register=1' % url, facebook_login=1)
+            response = self.client.post(url, post_data, follow=True)
+            self.assertEqual(wrapped_connect.call_count, 1)
+            self.assertIn('register', response.redirect_chain[0][0])
+            self.assertEqual(response.status_code, 200)
+
+        #user register next instead of next
+        with patch('django_facebook.views.connect_user', return_value=(CONNECT_ACTIONS.REGISTER, user)) as wrapped_connect:
+            post_data = dict(access_token='short_username', register_next='%s?register=1' % url, facebook_login=1)
+            response = self.client.post(url, post_data, follow=True)
+            self.assertEqual(wrapped_connect.call_count, 1)
+            self.assertIn('register', response.redirect_chain[0][0])
+            self.assertEqual(response.status_code, 200)
+
+        #test login
+        with patch('django_facebook.views.connect_user', return_value=(CONNECT_ACTIONS.LOGIN, user)) as wrapped_connect:
+            post_data = dict(access_token='short_username',
+                             next='%s?loggggg=1' % url, facebook_login=1)
+            response = self.client.post(url, post_data, follow=True)
+            self.assertEqual(wrapped_connect.call_count, 1)
+            self.assertIn('?loggggg=1', response.redirect_chain[0][0])
+            self.assertEqual(response.status_code, 200)
+
+        #test connect
+        with patch('django_facebook.views.connect_user', return_value=(CONNECT_ACTIONS.CONNECT, user)) as wrapped_connect:
+            post_data = dict(access_token='short_username',
+                             next='%s?loggggg=1' % url, facebook_login=1)
+            response = self.client.post(url, post_data, follow=True)
+            self.assertEqual(wrapped_connect.call_count, 1)
+            assert '?loggggg=1' in response.redirect_chain[0][0]
+            self.assertEqual(response.status_code, 200)
+
+        #test connect
+        from django_facebook import exceptions as facebook_exceptions
+        profile_error = facebook_exceptions.IncompleteProfileError()
+        profile_error.form = None
+        with patch('django_facebook.views.connect_user', return_value=(CONNECT_ACTIONS.REGISTER, user), side_effect=profile_error) as wrapped_connect:
+            post_data = dict(access_token='short_username',
+                             next='%s?loggggg=1' % url, facebook_login=1)
+            response = self.client.post(url, post_data, follow=True)
+            self.assertEqual(wrapped_connect.call_count, 1)
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.context)
+            assert response.template.name in facebook_settings.FACEBOOK_REGISTRATION_TEMPLATE or response.template.name == facebook_settings.FACEBOOK_REGISTRATION_TEMPLATE
+
+    def test_slow_connect(self):
+        '''
+        Test if we can do logins
+        django_facebook.connect.connect_user
+        '''
+        url = reverse('facebook_connect')
+
+        #test super slow Facebook
+        errors = [FacebookSSLError(), FacebookURLError(
+            '<urlopen error _ssl.c:489: The handshake operation timed out>')]
+        for error in errors:
+            with patch('django_facebook.views.FacebookUserConverter') as converter:
+                instance = converter.return_value
+                instance.is_authenticated = Mock(side_effect=error)
+                post_data = dict(access_token='short_username',
+                                 next='%s?loggggg=1' % url, facebook_login=1)
+                response = self.client.post(url, post_data, follow=True)
+                self.assertEqual(instance.is_authenticated.call_count, 1)
+                self.assertTrue(response.context)
+                assert '?loggggg=1' in response.redirect_chain[0][0]
+
+
+class OpenGraphShareTest(FacebookTest):
+    fixtures = ['users.json']
+
+    def test_follow_og_share(self):
+        from django_facebook.models import OpenGraphShare
+        user_url = 'http://www.fashiolista.com/style/neni/'
+        kwargs = dict(item=user_url)
+        user = User.objects.all()[:1][0]
+        from django.contrib.contenttypes.models import ContentType
+        love_content_type = ContentType.objects.get(
+            app_label='auth', model='user')
+        share = OpenGraphShare.objects.create(
+            user_id=user.id,
+            facebook_user_id=13123123,
+            action_domain='fashiolista:follow',
+            content_type=love_content_type,
+            object_id=user.id,
+        )
+        share.set_share_dict(kwargs)
+        share.save()
+        share.send()
+
+    def test_follow_og_share_error(self):
+        from django_facebook.models import OpenGraphShare
+        user_url = 'http://www.fashiolista.com/style/neni/'
+        kwargs = dict(item=user_url)
+        user = User.objects.all()[:1][0]
+        profile = user.get_profile()
+        profile.facebook_open_graph = True
+        profile.save()
+
+        from django.contrib.contenttypes.models import ContentType
+        love_content_type = ContentType.objects.get(
+            app_label='auth', model='user')
+        share = OpenGraphShare.objects.create(
+            user_id=user.id,
+            facebook_user_id=13123123,
+            action_domain='fashiolista:follow',
+            content_type=love_content_type,
+            object_id=user.id,
+        )
+        share.set_share_dict(kwargs)
+        share.save()
+        from open_facebook.exceptions import FacebookUnreachable
+        with mock.patch('open_facebook.api.OpenFacebook') as mocked:
+            instance = mocked.return_value
+            instance.set = Mock(side_effect=FacebookUnreachable('broken'))
+            share.send(graph=instance)
+            self.assertEqual(share.error_message, 'broken')
+            self.assertFalse(share.completed_at)
 
 
 class UserConnectTest(FacebookTest):
@@ -33,8 +208,12 @@ class UserConnectTest(FacebookTest):
         request = RequestMock().get('/')
         request.session = {}
         request.user = AnonymousUser()
-        get_persistent_graph(request, access_token='short_username')
-        
+
+        graph = get_facebook_graph(access_token='short_username')
+        FacebookUserConverter(graph)
+        action, user = connect_user(self.request, facebook_graph=graph)
+        self.assertEqual(action, CONNECT_ACTIONS.REGISTER)
+
     def test_gender_matching(self):
         request = RequestMock().get('/')
         request.session = {}
@@ -64,6 +243,30 @@ class UserConnectTest(FacebookTest):
         action, user = connect_user(self.request, facebook_graph=graph)
         self.assertEqual(action, CONNECT_ACTIONS.LOGIN)
 
+    def test_parallel_register(self):
+        '''
+        Adding some testing for the case when one person tries to register
+        multiple times in the same second
+        '''
+        graph = get_facebook_graph(access_token='short_username')
+        FacebookUserConverter(graph)
+        action, user = connect_user(self.request, facebook_graph=graph)
+        self.assertEqual(action, CONNECT_ACTIONS.REGISTER)
+
+        self.request.user.is_authenticated = lambda: False
+        with patch('django_facebook.connect.authenticate') as patched:
+            return_sequence = [user, None]
+
+            def side(*args, **kwargs):
+                value = return_sequence.pop()
+                return value
+
+            patched.side_effect = side
+            with patch('django_facebook.connect._register_user') as patched_register:
+                patched_register.side_effect = facebook_exceptions.AlreadyRegistered('testing parallel registers')
+                action, user = connect_user(self.request, facebook_graph=graph)
+                self.assertEqual(action, CONNECT_ACTIONS.LOGIN)
+
     def test_utf8(self):
         graph = get_facebook_graph(access_token='unicode_string')
         facebook = FacebookUserConverter(graph)
@@ -82,6 +285,24 @@ class UserConnectTest(FacebookTest):
         facebook = get_facebook_graph(access_token='tschellenbach')
         action, user = connect_user(self.request, facebook_graph=facebook)
         self.assertEqual(action, CONNECT_ACTIONS.LOGIN)
+
+    def test_fb_update_required(self):
+        def pre_update(sender, profile, facebook_data, **kwargs):
+            profile.pre_update_signal = True
+
+        Profile = get_profile_class()
+        signals.facebook_pre_update.connect(pre_update, sender=Profile)
+        facebook = get_facebook_graph(access_token='tschellenbach')
+
+        facebook_settings.FACEBOOK_FORCE_PROFILE_UPDATE_ON_LOGIN = True
+        action, user = connect_user(self.request, facebook_graph=facebook)
+        self.assertEqual(action, CONNECT_ACTIONS.LOGIN)
+        self.assertTrue(hasattr(user.get_profile(), 'pre_update_signal'))
+
+        facebook_settings.FACEBOOK_FORCE_PROFILE_UPDATE_ON_LOGIN = False
+        action, user = connect_user(self.request, facebook_graph=facebook)
+        self.assertEqual(action, CONNECT_ACTIONS.LOGIN)
+        self.assertFalse(hasattr(user.get_profile(), 'pre_update_signal'))
 
     def test_new_user(self):
         facebook = get_facebook_graph(access_token='new_user')
@@ -124,6 +345,12 @@ class UserConnectTest(FacebookTest):
         # The test form always sets username to test form
         self.assertEqual(user.username, 'Test form')
 
+    def test_connect_page(self):
+        url = reverse('facebook_connect')
+        c = Client()
+        response = c.get(url)
+        self.assertEqual(response.status_code, 200)
+
 
 class AuthBackend(FacebookTest):
     def test_auth_backend(self):
@@ -150,7 +377,7 @@ class ErrorMappingTest(FacebookTest):
     def test_mapping(self):
         from open_facebook import exceptions as open_facebook_exceptions
         raise_something = partial(FacebookConnection.raise_error, 0,
-                                  "(#200) The user hasn't authorized the " \
+                                  "(#200) The user hasn't authorized the "
                                   "application to perform this action")
         self.assertRaises(open_facebook_exceptions.PermissionException,
                           raise_something)
@@ -205,5 +432,3 @@ class SignalTest(FacebookTest):
                                  'pre_update_signal'), True)
         self.assertEqual(hasattr(user.get_profile(),
                                  'post_update_signal'), True)
-
-
