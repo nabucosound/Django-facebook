@@ -97,6 +97,10 @@ class AliasException(OpenFacebookException):
     codes = 803
 
 
+class UnsupportedDeleteRequest(OpenFacebookException):
+    pass
+
+
 class ParseException(OpenFacebookException):
     '''
     Anything preventing us from parsing the Facebook response

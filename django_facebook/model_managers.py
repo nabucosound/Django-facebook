@@ -3,9 +3,11 @@ from django.core.cache import cache
 from django.db import models
 import operator
 import random
-import datetime
+from datetime import timedelta
+from django_facebook.utils import compatible_datetime as datetime
 from django.contrib.contenttypes.models import ContentType
 import logging
+from open_facebook.exceptions import OAuthException, UnsupportedDeleteRequest
 logger = logging.getLogger(__name__)
 
 
@@ -68,8 +70,8 @@ class OpenGraphShareManager(models.Manager):
 
     def recently_failed(self):
         from django_facebook import settings as facebook_settings
-        now = datetime.datetime.today()
-        recent_delta = datetime.timedelta(
+        now = datetime.now()
+        recent_delta = timedelta(
             days=facebook_settings.FACEBOOK_OG_SHARE_RETRY_DAYS)
         recent = now - recent_delta
         failed = self.failed()
@@ -98,4 +100,9 @@ class OpenGraphShareManager(models.Manager):
         logger.info('found %s shares to remove', len(shares))
         for share in shares:
             logger.info('removed share %s', share)
-            share.remove()
+            try:
+                share.remove()
+            except (OAuthException, UnsupportedDeleteRequest), e:
+                # oauth exceptions happen when tokens are removed
+                # unsupported delete requests when the resource is already removed
+                logger.info('removing share failed, got error %s', e)

@@ -1,5 +1,13 @@
+try:
+    #using compatible_datetime instead of datetime only
+    #not to override the original datetime package
+    from django.utils import timezone as compatible_datetime
+except ImportError:
+    from datetime import datetime as compatible_datetime
+from datetime import datetime
 from django.http import QueryDict, HttpResponse, HttpResponseRedirect
 from django.conf import settings
+import django.contrib.auth
 from django.db import models, transaction
 import logging
 import re
@@ -109,11 +117,12 @@ class CanvasRedirect(HttpResponse):
     '''
     Redirect for Facebook Canvas pages
     '''
-    def __init__(self, redirect_to):
+    def __init__(self, redirect_to, show_body=True):
         self.redirect_to = redirect_to
         self.location = iri_to_uri(redirect_to)
 
-        context = dict(location=self.location)
+        context = dict(location=self.location,
+                       show_body=show_body)
         js_redirect = render_to_string(
             'django_facebook/canvas_redirect.html', context)
 
@@ -178,6 +187,15 @@ def get_profile_class():
     app_label, model = profile_string.split('.')
 
     return models.get_model(app_label, model)
+
+
+def get_user_model():
+    """For Django < 1.5 backward compatibility
+    """
+    if hasattr(django.contrib.auth, 'get_user_model'):
+        return django.contrib.auth.get_user_model()
+    else:
+        return django.contrib.auth.models.User
 
 
 @transaction.commit_on_success
@@ -447,3 +465,7 @@ def get_class_from_string(path, default='raise'):
         else:
             backend_class = default
     return backend_class
+
+
+def parse_like_datetime(dt):
+    return datetime.strptime(dt, "%Y-%m-%dT%H:%M:%S+0000")

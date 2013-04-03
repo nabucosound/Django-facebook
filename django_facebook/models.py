@@ -6,13 +6,19 @@ from django.db import models
 from django.db.models.base import ModelBase
 from django_facebook import model_managers, settings as facebook_settings
 from open_facebook.utils import json, camel_to_underscore
-import datetime
+from datetime import timedelta
+from django_facebook.utils import compatible_datetime as datetime
+from django_facebook.utils import get_user_model
+
 import logging
 import os
 logger = logging.getLogger(__name__)
 
 
-PROFILE_IMAGE_PATH = os.path.join('images', 'facebook_profiles/%Y/%m/%d')
+if facebook_settings.FACEBOOK_PROFILE_IMAGE_PATH:
+    PROFILE_IMAGE_PATH = settings.FACEBOOK_PROFILE_IMAGE_PATH
+else:
+    PROFILE_IMAGE_PATH = os.path.join('images', 'facebook_profiles/%Y/%m/%d')
 
 
 class FACEBOOK_OG_STATE:
@@ -128,7 +134,7 @@ class BaseFacebookProfileModel(models.Model):
         token_changed = access_token != old_token
         message = 'a new' if token_changed else 'the same'
         log_format = 'Facebook provided %s token, which expires at %s'
-        expires_delta = datetime.timedelta(days=60)
+        expires_delta = timedelta(days=60)
         logger.info(log_format, message, expires_delta)
         if token_changed:
             logger.info('Saving the new access token')
@@ -213,24 +219,7 @@ class FacebookProfile(FacebookProfileModel):
     Use this by setting
     AUTH_PROFILE_MODULE = 'django_facebook.FacebookProfile'
     '''
-    user = models.OneToOneField('auth.User')
-
-
-if settings.AUTH_PROFILE_MODULE == 'django_facebook.FacebookProfile':
-    '''
-    If we are using the django facebook profile model, create the model
-    and connect it to the user create signal
-    '''
-
-    from django.contrib.auth.models import User
-    from django.db.models.signals import post_save
-
-    #Make sure we create a FacebookProfile when creating a User
-    def create_facebook_profile(sender, instance, created, **kwargs):
-        if created:
-            FacebookProfile.objects.create(user=instance)
-
-    post_save.connect(create_facebook_profile, sender=User)
+    user = models.OneToOneField(get_user_model())
 
 
 class BaseModelMetaclass(ModelBase):
@@ -356,8 +345,7 @@ class OpenGraphShare(BaseModel):
     '''
     objects = model_managers.OpenGraphShareManager()
 
-    from django.contrib.auth.models import User
-    user = models.ForeignKey(User)
+    user = models.ForeignKey(get_user_model())
 
     #domain stores
     action_domain = models.CharField(max_length=255)
@@ -395,7 +383,7 @@ class OpenGraphShare(BaseModel):
     def send(self, graph=None):
         result = None
         #update the last attempt
-        self.last_attempt = datetime.datetime.now()
+        self.last_attempt = datetime.now()
         self.save()
 
         #see if the graph is enabled
@@ -418,7 +406,7 @@ class OpenGraphShare(BaseModel):
                     raise OpenFacebookException(error_message)
                 self.share_id = share_id
                 self.error_message = None
-                self.completed_at = datetime.datetime.now()
+                self.completed_at = datetime.now()
                 self.save()
             except OpenFacebookException, e:
                 logger.warn(
@@ -459,10 +447,12 @@ class OpenGraphShare(BaseModel):
         #see if the graph is enabled
         profile = self.user.get_profile()
         graph = graph or profile.get_offline_graph()
-
-        response = graph.delete(self.share_id)
-        self.removed_at = datetime.datetime.now()
-        self.save()
+        response = None
+        if graph:
+            response = graph.delete(self.share_id)
+            self.removed_at = datetime.now()
+            self.save()
+        return response
 
     def retry(self, graph=None, reset_retries=False):
         if self.completed_at:
@@ -494,8 +484,7 @@ class OpenGraphShare(BaseModel):
 
 
 class FacebookInvite(CreatedAtAbstractBase):
-    from django.contrib.auth.models import User
-    user = models.ForeignKey(User)
+    user = models.ForeignKey(get_user_model())
     user_invited = models.CharField(max_length=255)
     message = models.TextField(blank=True, null=True)
     type = models.CharField(blank=True, null=True, max_length=255)
